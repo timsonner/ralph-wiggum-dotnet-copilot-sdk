@@ -93,7 +93,7 @@ while (!taskComplete && iteration < MaxIterations)
     // and doesn't get confused by stale context.
     var config = new SessionConfig
     {
-        Model = "gpt-4o", // or "gpt-4"
+        Model = "claude-sonnet-4.5", // or "gpt-4"
         Tools = tools,
         SystemMessage = new SystemMessageConfig
         {
