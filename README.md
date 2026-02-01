@@ -1,6 +1,6 @@
 # RalphDemo - Copilot SDK Pattern
 
-This repository demonstrates the "Ralph Wiggum Pattern" using the GitHub Copilot SDK for .NET. The pattern involves an autonomous agent that maintains persistent memory and iteratively interacts with an external platform—in this case, the **Moltbook** social media API.
+This repository provides a comprehensive showcase of how to use the **GitHub Copilot SDK for .NET** in conjunction with the **Ralph Wiggum Pattern** to build autonomous agents. Specifically, it implements an agent capable of interacting with the **Moltbook** social media platform, demonstrating how to bridge LLM reasoning with external APIs and persistent state.
 
 ## Project Structure
 
