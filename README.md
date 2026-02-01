@@ -1,12 +1,14 @@
 # RalphDemo - Copilot SDK Pattern
 
-This repository demonstrates the "Ralph Wiggum Pattern" using the GitHub Copilot SDK for .NET. The pattern involves an autonomous agent that iteratively attempts to fix failing tests in a target application.
+This repository demonstrates the "Ralph Wiggum Pattern" using the GitHub Copilot SDK for .NET. The pattern involves an autonomous agent that maintains persistent memory and iteratively interacts with an external platform—in this case, the **Moltbook** social media API.
 
 ## Project Structure
 
-- **RalphAgent**: A console application that acts as the AI agent. It uses the Copilot SDK to interact with the model and tools to run tests and modify code.
-- **TargetApp**: A simple application (Calculator) intentionally containing bugs or incomplete implementation.
-- **TargetApp.Tests**: Unit tests for the TargetApp. The agent's goal is to make these tests pass.
+- **RalphAgent**: The main console application acting as the AI agent.
+- **RalphAgent/Program.cs**: Contains the agent loop, Moltbook API client, and tool definitions.
+- **RalphAgent/goal.md**: Defines the high-level objective for the agent (e.g., "Become a popular influencer").
+- **RalphAgent/skills.md**: Lists the capabilities or persona traits the agent should embody.
+- **RalphAgent/memory.json**: A persistent JSON store where the agent saves its state (API keys, identity, last actions).
 
 ## Prerequisites
 
@@ -21,22 +23,33 @@ This repository demonstrates the "Ralph Wiggum Pattern" using the GitHub Copilot
     cd RalphDemo/RalphAgent
     ```
 
-2.  **Run the Agent:**
+2.  **Configure the Agent:**
+    - Edit `goal.md` to set what you want the agent to achieve on Moltbook.
+    - Edit `skills.md` to give the agent specific behavior guidelines.
+
+3.  **Run the Agent:**
     ```bash
     dotnet run
     ```
 
     The agent will:
-    -   Start a session with the configured model (e.g., `claude-sonnet-4.5`).
-    -   Run the tests in `TargetApp.Tests`.
-    -   Analyze failures and attempt to fix `TargetApp`.
-    -   Repeat until all tests pass or the maximum iteration count is reached.
+    -   Load its configuration and memory.
+    -   Connect to the Moltbook API (`https://www.moltbook.com/api/v1/`).
+    -   **Register** itself if it hasn't already (saving credentials to `memory.json`).
+    -   **Observe** the feed or search for content.
+    -   **Post** content based on its observations and goals.
+    -   Run for a maximum of 10 iterations per session.
 
 ## Configuration
 
-The agent is configured in `RalphDemo/RalphAgent/Program.cs`. You can modify:
--   `MaxIterations`: Maximum number of repair attempts.
--   `SessionConfig`: Model selection and system message.
+The agent's core logic is in `RalphDemo/RalphAgent/Program.cs`. Key configurable elements include:
+-   **MaxIterations**: Controls how long the agent runs in one session.
+-   **System Message**: Dynamically built from `skills.md`, `goal.md`, and `memory.json`.
+-   **Tools**: The agent has access to Moltbook-specific tools:
+    -   `register_agent`: Creates a new account.
+    -   `get_feed`: Reads recent or popular posts.
+    -   `create_post`: Publishes new content.
+    -   `search`: Finds relevant posts.
 
 ## References
 
