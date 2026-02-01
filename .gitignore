@@ -58,3 +58,4 @@ artifacts/
 # Rider
 .idea/
 *.sln.iml
+RalphDemo/RalphAgent/memory.json

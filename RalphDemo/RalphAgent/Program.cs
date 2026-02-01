@@ -1,5 +1,6 @@
-using System.ComponentModel;
-using System.Diagnostics;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Net.Http.Json;
 using GitHub.Copilot.SDK;
 using Microsoft.Extensions.AI;
 
@@ -7,70 +8,155 @@ using Microsoft.Extensions.AI;
 // CONFIGURATION
 // ---------------------------------------------------------
 const int MaxIterations = 10;
-string SolutionRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../.."));
-string TargetProjectDir = Path.Combine(SolutionRoot, "TargetApp");
-string TestProjectDir = Path.Combine(SolutionRoot, "TargetApp.Tests");
+string ProjectRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../"));
+string MemoryPath = Path.Combine(ProjectRoot, "memory.json");
+string SkillsPath = Path.Combine(ProjectRoot, "skills.md");
+string GoalPath = Path.Combine(ProjectRoot, "goal.md");
 
-Console.WriteLine($"[Ralph] Starting... Root: {SolutionRoot}");
+Console.WriteLine($"[Ralph] Starting... Root: {ProjectRoot}");
+
+// ---------------------------------------------------------
+// STATE MANAGEMENT & HTTP CLIENT
+// ---------------------------------------------------------
+AgentMemory memory = new AgentMemory();
+if (File.Exists(MemoryPath))
+{
+    try
+    {
+        var json = File.ReadAllText(MemoryPath);
+        memory = JsonSerializer.Deserialize<AgentMemory>(json) ?? new AgentMemory();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[Ralph] Warning: Could not read memory file. Starting fresh. Error: {ex.Message}");
+        memory = new AgentMemory();
+    }
+}
+
+var httpClient = new HttpClient { BaseAddress = new Uri("https://www.moltbook.com/api/v1/") };
+
+void SaveMemory()
+{
+    var json = JsonSerializer.Serialize(memory, new JsonSerializerOptions { WriteIndented = true });
+    File.WriteAllText(MemoryPath, json);
+}
+
+void EnsureAuth()
+{
+    if (!string.IsNullOrEmpty(memory.ApiKey))
+    {
+        httpClient.DefaultRequestHeaders.Authorization = 
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", memory.ApiKey);
+    }
+}
 
 // ---------------------------------------------------------
 // TOOLS
 // ---------------------------------------------------------
 var tools = new List<AIFunction>
 {
-    AIFunctionFactory.Create(async () => 
+    AIFunctionFactory.Create((string key) => 
     {
-        Console.WriteLine("[Tool] Running tests...");
-        var process = new Process
+        memory.ApiKey = key;
+        SaveMemory();
+        EnsureAuth();
+        return "API Key saved manually.";
+    }, "save_api_key", "Manually save the API key if registration auto-save fails."),
+
+    AIFunctionFactory.Create(async (string name, string description) => 
+    {
+        Console.WriteLine($"[Tool] Registering agent: {name}");
+        try 
         {
-            StartInfo = new ProcessStartInfo
+            var response = await httpClient.PostAsJsonAsync("agents/register", new { name, description });
+            var content = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+                return $"Error: {response.StatusCode} - {content}";
+            
+            // Try to extract API key flexibly
+            using var doc = JsonDocument.Parse(content);
+            string? newKey = null;
+
+            // 1. Check specific 'agent' object (Moltbook Standard)
+            if (doc.RootElement.TryGetProperty("agent", out var agentObj))
             {
-                FileName = "dotnet",
-                Arguments = $"test {TestProjectDir}",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
+                if (agentObj.TryGetProperty("api_key", out var ak)) newKey = ak.GetString();
+                if (agentObj.TryGetProperty("claim_url", out var cu)) memory.ClaimUrl = cu.GetString();
             }
-        };
-        process.Start();
-        string output = await process.StandardOutput.ReadToEndAsync();
-        string error = await process.StandardError.ReadToEndAsync();
-        await process.WaitForExitAsync();
 
-        if (process.ExitCode == 0)
-            return "Tests PASSED. \n" + output;
-        else
-            return "Tests FAILED. \n" + output + "\nErrors:\n" + error;
-    }, "run_tests", "Runs the unit tests. Returns the output."),
+            // 2. Fallback checks
+            if (string.IsNullOrEmpty(newKey) && doc.RootElement.ValueKind == JsonValueKind.Object)
+            {
+                if (doc.RootElement.TryGetProperty("token", out var t)) newKey = t.GetString();
+                else if (doc.RootElement.TryGetProperty("api_key", out var k)) newKey = k.GetString();
+                else if (doc.RootElement.TryGetProperty("key", out var key)) newKey = key.GetString();
+            }
 
-    AIFunctionFactory.Create((string path) => 
+            if (!string.IsNullOrEmpty(newKey))
+            {
+                memory.ApiKey = newKey;
+                memory.AgentName = name;
+                SaveMemory();
+                EnsureAuth();
+                
+                string msg = "Registration successful. ApiKey saved.";
+                if (!string.IsNullOrEmpty(memory.ClaimUrl))
+                    msg += $"\nIMPORTANT: You must visit this URL to claim the agent: {memory.ClaimUrl}";
+                
+                return msg;
+            }
+
+            return $"Registration succeeded but could not auto-parse token from: {content}. Please manually save it if possible.";
+        }
+        catch (Exception ex)
+        {
+            return $"Exception during registration: {ex.Message}";
+        }
+    }, "register_agent", "Register a new agent. Returns API key info."),
+
+    AIFunctionFactory.Create(async (string sort) => 
     {
-        var fullPath = Path.Combine(SolutionRoot, path);
-        if (!File.Exists(fullPath)) return $"File not found: {fullPath}";
-        return File.ReadAllText(fullPath);
-    }, "read_file", "Reads a file from the solution. Provide relative path (e.g., 'TargetApp/Calculator.cs')."),
+        EnsureAuth();
+        Console.WriteLine("[Tool] Getting feed...");
+        try {
+            var response = await httpClient.GetAsync($"posts?sort={sort}");
+            return await response.Content.ReadAsStringAsync();
+        } catch (Exception ex) { return ex.Message; }
+    }, "get_feed", "Gets the latest posts. Sort can be 'recent' or 'popular'."),
 
-    AIFunctionFactory.Create((string path, string content) => 
+    AIFunctionFactory.Create(async (string title, string content, string submolt) => 
     {
-        var fullPath = Path.Combine(SolutionRoot, path);
-        File.WriteAllText(fullPath, content);
-        return $"File written: {fullPath}";
-    }, "write_file", "Writes content to a file. Provide relative path."),
+        EnsureAuth();
+        Console.WriteLine($"[Tool] Creating post: {title}");
+         try {
+            var response = await httpClient.PostAsJsonAsync("posts", new { title, content, submolt });
+            var result = await response.Content.ReadAsStringAsync();
+            memory.LastAction = DateTimeOffset.Now;
+            SaveMemory();
+            return result;
+        } catch (Exception ex) { return ex.Message; }
+    }, "create_post", "Creates a new post."),
+
+    AIFunctionFactory.Create(async (string query) => 
+    {
+        EnsureAuth();
+        Console.WriteLine($"[Tool] Searching: {query}");
+         try {
+            var response = await httpClient.GetAsync($"search?q={Uri.EscapeDataString(query)}");
+            return await response.Content.ReadAsStringAsync();
+        } catch (Exception ex) { return ex.Message; }
+    }, "search", "Search for posts."),
     
     AIFunctionFactory.Create(() => 
     {
-        // Simple list of relevant files to help the agent discover
-        return string.Join("\n", Directory.GetFiles(TargetProjectDir, "*.cs", SearchOption.AllDirectories)
-            .Concat(Directory.GetFiles(TestProjectDir, "*.cs", SearchOption.AllDirectories))
-            .Select(f => Path.GetRelativePath(SolutionRoot, f)));
-    }, "list_files", "Lists all C# files in the target projects.")
+        return JsonSerializer.Serialize(memory);
+    }, "read_memory", "Reads the agent's internal memory state.")
 };
 
 // ---------------------------------------------------------
 // CLIENT SETUP
 // ---------------------------------------------------------
-// Note: In a real scenario, ensure 'github-copilot-cli' is installed and authenticated.
 await using var client = new CopilotClient();
 await client.StartAsync();
 
@@ -85,54 +171,58 @@ while (!taskComplete && iteration < MaxIterations)
     iteration++;
     Console.WriteLine($"\n--- [Ralph] Iteration {iteration} ---");
 
-    // 1. Check status (Run tests) to see if we are done
-    // We run this *outside* the agent first to check termination condition, 
-    // OR we let the agent run it. Let's let the agent run it to decide what to do.
+    EnsureAuth();
     
-    // We create a FRESH session each time to ensure it sees the latest file state 
-    // and doesn't get confused by stale context.
+    string skills = File.Exists(SkillsPath) ? File.ReadAllText(SkillsPath) : "No skills defined.";
+    string goal = File.Exists(GoalPath) ? File.ReadAllText(GoalPath) : "No goal defined.";
+
     var config = new SessionConfig
     {
-        Model = "claude-sonnet-4.5", // or "gpt-4"
+        Model = "claude-sonnet-4.5", 
         Tools = tools,
         SystemMessage = new SystemMessageConfig
         {
-            Content = "You are an autonomous repair agent. " +
-                        "Your goal is to make all tests pass. " +
-                        "1. List files to locate the code. " +
-                        "2. Run tests to see failures. " +
-                        "3. Read the failing code. " +
-                        "4. Fix the code using 'write_file'. " +
-                        "5. Run tests again to verify. " +
-                        "If tests pass, say 'SUCCESS' and stop."
+            Content = $@"
+You are an autonomous agent using the Ralph pattern.
+
+CONTEXT:
+{skills}
+
+GOAL:
+{goal}
+
+CURRENT MEMORY:
+{JsonSerializer.Serialize(memory)}
+
+Instructions:
+1. Check your memory to see if you are registered.
+2. If not registered, register immediately.
+3. If registered, check the feed or search to understand the vibe.
+4. Create a post introducing yourself.
+5. If successful, output 'SUCCESS: [Post URL/ID]' to end the session.
+"
         }
     };
 
     await using var session = await client.CreateSessionAsync(config);
 
-    // Initial prompt for this turn
     await session.SendAsync(new MessageOptions 
     { 
-        Prompt = $"Iteration {iteration}. Current status? (Please run tests first)" 
+        Prompt = $"Iteration {iteration}. What is your next move?" 
     });
 
-    // Wait for this turn to complete
     bool turnSuccess = await ProcessSessionUntilIdleAsync(session);
 
     if (turnSuccess)
     {
-        Console.WriteLine("[Ralph] Agent reported success! Verifying one last time...");
-        // Double check
-        // (In a real impl, we'd parse the tool output or check a flag)
-        // For this demo, we'll assume if the agent says "SUCCESS" we break, 
-        // or we could just run the test tool directly here.
+        break;
     }
 }
 
 if (taskComplete)
-    Console.WriteLine("[Ralph] I'm helping! (All tests passed)");
+    Console.WriteLine("[Ralph] Mission Accomplished.");
 else
-    Console.WriteLine("[Ralph] I tried my best, but ran out of iterations.");
+    Console.WriteLine("[Ralph] Max iterations reached.");
 
 
 // ---------------------------------------------------------
@@ -152,22 +242,19 @@ async Task<bool> ProcessSessionUntilIdleAsync(CopilotSession session)
                 if (msg.Data.Content.Contains("SUCCESS"))
                 {
                     successSignaled = true;
-                    taskComplete = true; // Break the outer loop
+                    taskComplete = true; 
                 }
                 break;
             
             case ToolExecutionStartEvent tool:
                 Console.WriteLine($"[Tool]: Executing {tool.Data.ToolName}...");
                 break;
-
+                
             case ToolExecutionCompleteEvent toolResult:
-                // Check if tests passed in the tool result
-                if (toolResult.Data.Result?.Content.Contains("Tests PASSED") == true)
-                {
-                    Console.WriteLine("[Ralph] Tests passed during tool execution!");
-                    // We could mark complete here, but let the agent confirm
-                }
-                break;
+                 string content = toolResult.Data.Result?.Content as string ?? "";
+                 string preview = content.Length > 100 ? content.Substring(0, 100) + "..." : content;
+                 Console.WriteLine($"[Tool Result]: {preview}");
+                 break;
 
             case SessionIdleEvent: 
                 tcs.TrySetResult(successSignaled); 
@@ -181,4 +268,15 @@ async Task<bool> ProcessSessionUntilIdleAsync(CopilotSession session)
     });
 
     return await tcs.Task;
+}
+
+// ---------------------------------------------------------
+// TYPE DEFINITIONS
+// ---------------------------------------------------------
+class AgentMemory
+{
+    public string? ApiKey { get; set; }
+    public string? AgentName { get; set; }
+    public string? ClaimUrl { get; set; }
+    public DateTimeOffset? LastAction { get; set; }
 }
