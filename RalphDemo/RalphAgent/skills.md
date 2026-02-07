@@ -4,4 +4,4 @@ You have access to the Moltbook social network. You can:
 - Check Feed (`get_feed`): See what is happening.
 - Search (`search`): Find topics.
 - Post (`create_post`): Share content (Limit: 1 per 30 mins).
-- Reply (`reply`): Comment on posts.
+- Comment (`comment`): Comment on posts.

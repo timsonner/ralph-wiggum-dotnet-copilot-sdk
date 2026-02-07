@@ -3,11 +3,13 @@ using System.Text.Json.Serialization;
 using System.Net.Http.Json;
 using GitHub.Copilot.SDK;
 using Microsoft.Extensions.AI;
+using ModelContextProtocol.Client;
+using ModelContextProtocol.Protocol;
 
 // ---------------------------------------------------------
 // CONFIGURATION
 // ---------------------------------------------------------
-const int MaxIterations = 10;
+const int MaxIterations = 30;
 string ProjectRoot = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../"));
 string MemoryPath = Path.Combine(ProjectRoot, "memory.json");
 string SkillsPath = Path.Combine(ProjectRoot, "skills.md");
@@ -148,11 +150,105 @@ var tools = new List<AIFunction>
         } catch (Exception ex) { return ex.Message; }
     }, "search", "Search for posts."),
     
+    AIFunctionFactory.Create(async (string postId, string content, string? parentId) => 
+    {
+        EnsureAuth();
+        Console.WriteLine($"[Tool] Adding comment to post {postId}");
+        try {
+            object payload = string.IsNullOrEmpty(parentId) 
+                ? new { content = content }
+                : (object)new { content = content, parent_id = parentId };
+            var response = await httpClient.PostAsJsonAsync($"posts/{postId}/comments", payload);
+            var result = await response.Content.ReadAsStringAsync();
+            memory.LastAction = DateTimeOffset.Now;
+            SaveMemory();
+            return result;
+        } catch (Exception ex) { return ex.Message; }
+    }, "comment", "Add a comment to a post. Requires postId and content. Optional parentId for replies."),
+    
     AIFunctionFactory.Create(() => 
     {
         return JsonSerializer.Serialize(memory);
     }, "read_memory", "Reads the agent's internal memory state.")
 };
+
+var mcpClient = await McpClient.CreateAsync(new StdioClientTransport(new StdioClientTransportOptions
+{
+    Name = "KaliMCP",
+    Command = "/bin/bash",
+    Arguments = ["-c", "CONTAINER_ID=$(docker ps -q --filter ancestor=kali-mcp 2>/dev/null | head -1); if [ -n \"$CONTAINER_ID\" ]; then exec docker exec -i \"$CONTAINER_ID\" dotnet KaliMCP.dll; else exec docker run --rm -i --privileged --network host -v kali_mcp_data:/var/lib/docker kali-mcp; fi"]
+}));
+
+var mcpTools = await mcpClient.ListToolsAsync();
+Console.WriteLine($"[Ralph] Found {mcpTools.Count} MCP tools from Kali server.");
+foreach (var tool in mcpTools)
+{
+    Console.WriteLine($"[Ralph] Processing MCP tool: {tool.Name}");
+    if (tool.Name == "kali-exec")
+    {
+        tools.Add(AIFunctionFactory.Create(async (string command, string? image, string? containerName) =>
+        {
+            try
+            {
+                var result = await mcpClient.CallToolAsync("kali-exec", new Dictionary<string, object?> { ["command"] = command, ["image"] = image, ["containerName"] = containerName });
+                return result.Content.OfType<TextContentBlock>().FirstOrDefault()?.Text ?? "No output";
+            }
+            catch (Exception ex)
+            {
+                return $"Error: {ex.Message}";
+            }
+        }, "kali-exec", "Execute a shell command in the persistent Kali Linux container."));
+        Console.WriteLine($"[Ralph] Added tool: kali-exec");
+    }
+    else if (tool.Name == "kali-container-status")
+    {
+        tools.Add(AIFunctionFactory.Create(async (string? containerName) =>
+        {
+            try
+            {
+                var result = await mcpClient.CallToolAsync("kali-container-status", new Dictionary<string, object?> { ["containerName"] = containerName });
+                return result.Content.OfType<TextContentBlock>().FirstOrDefault()?.Text ?? "No output";
+            }
+            catch (Exception ex)
+            {
+                return $"Error: {ex.Message}";
+            }
+        }, "kali-container-status", "Check the status of the persistent Kali Linux container."));
+        Console.WriteLine($"[Ralph] Added tool: kali-container-status");
+    }
+    else if (tool.Name == "kali-container-restart")
+    {
+        tools.Add(AIFunctionFactory.Create(async (string? image, string? containerName) =>
+        {
+            try
+            {
+                var result = await mcpClient.CallToolAsync("kali-container-restart", new Dictionary<string, object?> { ["image"] = image, ["containerName"] = containerName });
+                return result.Content.OfType<TextContentBlock>().FirstOrDefault()?.Text ?? "No output";
+            }
+            catch (Exception ex)
+            {
+                return $"Error: {ex.Message}";
+            }
+        }, "kali-container-restart", "Restart the persistent Kali Linux container."));
+        Console.WriteLine($"[Ralph] Added tool: kali-container-restart");
+    }
+    else if (tool.Name == "kali-container-stop")
+    {
+        tools.Add(AIFunctionFactory.Create(async (string? containerName, bool removeContainer) =>
+        {
+            try
+            {
+                var result = await mcpClient.CallToolAsync("kali-container-stop", new Dictionary<string, object?> { ["containerName"] = containerName, ["removeContainer"] = removeContainer });
+                return result.Content.OfType<TextContentBlock>().FirstOrDefault()?.Text ?? "No output";
+            }
+            catch (Exception ex)
+            {
+                return $"Error: {ex.Message}";
+            }
+        }, "kali-container-stop", "Stop the persistent Kali Linux container."));
+        Console.WriteLine($"[Ralph] Added tool: kali-container-stop");
+    }
+}
 
 // ---------------------------------------------------------
 // CLIENT SETUP
@@ -195,11 +291,10 @@ CURRENT MEMORY:
 {JsonSerializer.Serialize(memory)}
 
 Instructions:
-1. Check your memory to see if you are registered.
-2. If not registered, register immediately.
-3. If registered, check the feed or search to understand the vibe.
-4. Create a post introducing yourself.
-5. If successful, output 'SUCCESS: [Post URL/ID]' to end the session.
+1. Review the goal content carefully.
+2. Execute the steps required to achieve the goal.
+3. Use the available tools effectively.
+4. When the goal is fully achieved according to the usage instructions, Output 'SUCCESS' with a summary.
 "
         }
     };
@@ -248,12 +343,15 @@ async Task<bool> ProcessSessionUntilIdleAsync(CopilotSession session)
             
             case ToolExecutionStartEvent tool:
                 Console.WriteLine($"[Tool]: Executing {tool.Data.ToolName}...");
+                if (tool.Data.Arguments != null)
+                {
+                    Console.WriteLine($"[Tool Args]: {JsonSerializer.Serialize(tool.Data.Arguments)}");
+                }
                 break;
                 
             case ToolExecutionCompleteEvent toolResult:
                  string content = toolResult.Data.Result?.Content as string ?? "";
-                 string preview = content.Length > 100 ? content.Substring(0, 100) + "..." : content;
-                 Console.WriteLine($"[Tool Result]: {preview}");
+                 Console.WriteLine($"[Tool Result]: {content}");
                  break;
 
             case SessionIdleEvent: 
